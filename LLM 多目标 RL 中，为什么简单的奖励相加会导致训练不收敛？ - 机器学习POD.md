@@ -16,6 +16,187 @@
 
 传统的标量化（Scalarization）方案主要包括奖励组合（Reward Combination）和优势组合（Advantage Combination）。然而，作者指出这两者存在严重缺陷：**奖励组合**由于方差不一致，往往会在组合后产生极大的优势函数平方幅值，导致策略梯度波动巨大、训练失稳；而基于独立归一化的**优势组合**（如 GDPO）虽然稳定了梯度幅值，却使用静态超参数，且在归一化过程中将各个目标完全隔绝，无法捕获不同目标之间的协同或对抗关系。
 
+----------------
+notes： 
+1. 总结：优势组合 AC / GDPO 是什么？
+
+- 优势组合，Advantage Combination, AC，指的是：
+    - 在多奖励 RL 训练里，不是先把多个 reward 加起来，**而是先分别把每个 reward 转成 advantage**，再把这些 advantage 加起来作为最终训练信号。
+
+- GDPO 可以理解为 AC 思路在 GRPO 多奖励场景下的一个具体实现。它的核心做法是：
+    - **对每个 reward 维度单独做组内归一化**，得到每个 reward 的 advantage，然后再组合这些 advantage。
+
+GDPO 的全称一般指 Group reward-Decoupled Normalization Policy Optimization，它主要解决的问题是：多奖励直接相加后再归一化，容易导致某些 reward 信号被吞掉，训练方向变模糊。 论文也明确指出，直接把 GRPO 用到多奖励设置时，可能让不同 reward 组合坍缩成相同或分辨率很低的 advantage 信号，从而影响收敛和稳定性。 ￼
+
+2. 为什么需要 AC/GDPO？
+
+假设你训练一个代码 Agent，有两个 reward：
+
+Reward	含义
+correctness reward	代码是否解决问题
+format reward	输出格式是否符合 JSON / tool-call schema
+
+普通做法可能是：
+
+总 reward = correctness + format
+
+然后对总 reward 做 GRPO 的组内归一化。
+
+问题是：不同 reward 的尺度、方差、稀疏程度不一样。
+例如：
+
+* correctness 只有 0/1；
+* format 可能是 0 到 10；
+* length reward 可能是一个连续惩罚；
+* safety reward 可能大部分时候都是 1，只有少数时候是 0。
+
+如果直接加起来，**数值大的 reward 会主导训练。模型可能更关心格式，而不是正确性；或者更关心短答案，而牺牲推理质量。**
+
+GDPO 的做法是：
+
+先分别归一化 correctness reward、format reward、length reward
+再把它们的 advantage 加起来
+
+这样每个目标都有机会发出清晰的训练信号。**Axolotl 的 RLHF 文档也把 GDPO 描述为 GRPO 的多奖励扩展**：它通过先独立归一化每个 reward function，再组合它们，来缓解 reward advantage collapse 问题。 ￼
+
+⸻
+
+3. 用一个简单例子理解
+
+假设同一个 prompt 下，模型采样了 4 个回答：
+
+回答	正确性 reward	格式 reward
+A	1	0
+B	1	10
+C	0	10
+D	0	0
+
+普通 reward 相加
+
+直接加起来：
+
+回答	总 reward
+A	1
+B	11
+C	10
+D	0
+
+这时排序是：
+
+B > C > A > D
+
+问题来了：C 是错的，但因为格式分很高，它几乎和 B 一样好；A 是对的，但因为格式分低，被压得很靠后。
+
+这会让模型学到一种错误倾向：
+
+格式好可能比答案正确还重要。
+
+⸻
+
+4. AC/GDPO 怎么做？
+
+AC/GDPO 会先分别看两个维度。
+
+第一步：正确性维度单独归一化
+
+正确性是：
+
+回答	correctness
+A	1
+B	1
+C	0
+D	0
+
+所以 A、B 在正确性上是好的，C、D 是差的。
+
+可以粗略理解成：
+
+回答	correctness advantage
+A	+1
+B	+1
+C	-1
+D	-1
+
+第二步：格式维度单独归一化
+
+格式是：
+
+回答	format
+A	0
+B	10
+C	10
+D	0
+
+所以 B、C 在格式上是好的，A、D 是差的。
+
+粗略理解成：
+
+回答	format advantage
+A	-1
+B	+1
+C	+1
+D	-1
+
+第三步：组合 advantage
+
+如果两个目标同等重要：
+
+回答	correctness advantage	format advantage	总 advantage
+A	+1	-1	0
+B	+1	+1	+2
+C	-1	+1	0
+D	-1	-1	-2
+
+最后训练信号变成：
+
+B 最值得增强
+D 最应该抑制
+A 和 C 各有优缺点，暂时中性
+
+这比直接 reward 相加更合理，因为它不会让 格式高但答案错 的 C 直接压过 答案对但格式差 的 A。
+
+
+7. 在你的场景里怎么用？
+
+比如你要训练一个 Skill 风险扫描模型，reward 可以设计成：
+
+Reward	示例
+漏洞识别正确性	是否找到了真实风险点
+误报控制	是否没有乱报风险
+证据定位	是否指出具体代码位置 / 调用链
+修复建议质量	修复建议是否可执行
+输出格式	是否符合 JSON schema
+
+如果直接加 reward：
+
+总 reward = 漏洞识别 + 误报控制 + 证据定位 + 修复建议 + 格式
+
+可能出现一个问题：
+
+模型学会了输出格式很漂亮、解释很完整，但真正漏洞判断不准。
+
+用 AC/GDPO 就可以让每个 reward 先独立产生训练信号：
+
+A_漏洞识别
+A_误报控制
+A_证据定位
+A_修复建议
+A_格式
+
+然后组合：
+
+A_total = 2.0 * A_漏洞识别
+        + 1.5 * A_误报控制
+        + 1.0 * A_证据定位
+        + 0.5 * A_修复建议
+        + 0.3 * A_格式
+
+这样你可以明确告诉模型：
+
+漏洞判断和误报控制最重要，格式只是辅助目标。
+
+----------------
+
 为解决这些局限性，作者提出了 **Dynamic Variance-adaptive Advantage Optimization (DVAO，动态方差自适应优势优化)** 。该方法根据每个目标在当前采样组（Rollout Group）内的实测方差动态调整其组合权重。方差越大（通常意味着学习信号更强），该目标的权重就被动态调大；方差越小，权重则被抑制。
 
 理论分析与多模型（Qwen3、Qwen2.5 涉及 3B 到 8B 不同尺度）实验证明，DVAO 不仅在数学上保证了优势函数幅值的有界性以维护训练稳定，还引入了隐式的**自适应交叉正则（Self-adaptive Cross-objective Regularization）**机制。在数学推理与工具调用基准测试中，DVAO 显著优于传统基线，并在精度与约束条件的折中上实现了**帕累托前沿（Pareto Frontier）**的主导。
